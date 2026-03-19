@@ -2,5 +2,3 @@ flask==3.0.3
 requests==2.32.3
 gunicorn==22.0.0
 edge-tts==6.1.9
-imageio[ffmpeg]==2.34.1
-imageio-ffmpeg==0.5.1
