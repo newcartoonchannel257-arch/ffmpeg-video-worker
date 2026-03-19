@@ -1,20 +1,10 @@
 from flask import Flask, request, jsonify
-import subprocess
-import os
-import uuid
-import requests
-import base64
-import shutil
-import json
-import asyncio
+import subprocess, os, uuid, requests, base64, shutil, json, asyncio
 import edge_tts
-import imageio_ffmpeg
 
 app = Flask(__name__)
 WORK_DIR = "/tmp/videos"
 os.makedirs(WORK_DIR, exist_ok=True)
-
-FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
 
 VOICES = {
     "english":    "en-US-AriaNeural",
@@ -25,18 +15,35 @@ VOICES = {
     "portuguese": "pt-BR-FranciscaNeural"
 }
 
-async def generate_tts(text, voice, output_path):
-    communicate = edge_tts.Communicate(text, voice)
-    await communicate.save(output_path)
+async def generate_tts(text, voice, path):
+    await edge_tts.Communicate(text, voice).save(path)
 
-@app.route("/health", methods=["GET"])
+def run_cmd(cmd):
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        raise Exception(f"Command failed: {r.stderr}")
+    return r.stdout
+
+def get_ffmpeg():
+    for p in ["/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg"]:
+        if os.path.exists(p):
+            return p
+    return "ffmpeg"
+
+def get_ffprobe():
+    for p in ["/usr/bin/ffprobe", "/usr/local/bin/ffprobe"]:
+        if os.path.exists(p):
+            return p
+    return "ffprobe"
+
+@app.route("/health")
 def health():
-    return jsonify({
-        "status": "ok",
-        "message": "FFmpeg worker + Edge-TTS running",
-        "ffmpeg": FFMPEG_PATH,
-        "voices": list(VOICES.keys())
-    })
+    ff = get_ffmpeg()
+    try:
+        v = subprocess.run([ff, "-version"], capture_output=True, text=True).stdout.split('\n')[0]
+    except:
+        v = "not found"
+    return {"status": "ok", "ffmpeg": v, "voices": list(VOICES.keys())}
 
 @app.route("/create-video", methods=["POST"])
 def create_video():
@@ -48,76 +55,63 @@ def create_video():
         image_urls  = data.get("image_urls", [])
         script_text = data.get("script_text", "")
         language    = data.get("language", "english")
-        audio_b64   = data.get("audio_base64", "")
 
         if not image_urls:
-            return jsonify({"error": "No image_urls provided"}), 400
-        if not script_text and not audio_b64:
-            return jsonify({"error": "Provide script_text or audio_base64"}), 400
+            return {"error": "No image_urls"}, 400
+        if not script_text:
+            return {"error": "No script_text"}, 400
 
-        # 1. Generate audio via Edge-TTS
+        ff = get_ffmpeg()
+        fp = get_ffprobe()
+
+        # 1. TTS audio
         audio_path = os.path.join(job_dir, "audio.mp3")
-        if script_text and not audio_b64:
-            voice = VOICES.get(language, VOICES["english"])
-            asyncio.run(generate_tts(script_text, voice, audio_path))
-        else:
-            with open(audio_path, "wb") as f:
-                f.write(base64.b64decode(audio_b64))
+        voice = VOICES.get(language, VOICES["english"])
+        asyncio.run(generate_tts(script_text, voice, audio_path))
 
         # 2. Download images
         image_paths = []
         for i, url in enumerate(image_urls[:5]):
-            img_path = os.path.join(job_dir, f"img_{i:02d}.jpg")
+            p = os.path.join(job_dir, f"img_{i:02d}.jpg")
             r = requests.get(url, timeout=30)
-            with open(img_path, "wb") as f:
-                f.write(r.content)
-            image_paths.append(img_path)
+            open(p, "wb").write(r.content)
+            image_paths.append(p)
 
-        # 3. Get audio duration via ffprobe
-        probe = subprocess.run([
-            FFMPEG_PATH.replace("ffmpeg", "ffprobe"),
-            "-v", "quiet", "-print_format", "json", "-show_format", audio_path
-        ], capture_output=True, text=True)
-        probe_data = json.loads(probe.stdout)
-        duration   = float(probe_data["format"]["duration"])
+        # 3. Audio duration
+        probe = subprocess.run([fp, "-v", "quiet", "-print_format", "json", "-show_format", audio_path], capture_output=True, text=True)
+        duration = float(json.loads(probe.stdout)["format"]["duration"])
 
-        # 4. Slideshow concat
-        img_dur     = duration / len(image_paths)
-        concat_file = os.path.join(job_dir, "concat.txt")
-        with open(concat_file, "w") as f:
+        # 4. Concat file
+        img_dur = duration / len(image_paths)
+        concat  = os.path.join(job_dir, "concat.txt")
+        with open(concat, "w") as f:
             for p in image_paths:
                 f.write(f"file '{p}'\nduration {img_dur:.2f}\n")
             f.write(f"file '{image_paths[-1]}'\n")
 
-        slideshow = os.path.join(job_dir, "slideshow.mp4")
-        subprocess.run([
-            FFMPEG_PATH, "-y", "-f", "concat", "-safe", "0", "-i", concat_file,
+        # 5. Slideshow
+        slide = os.path.join(job_dir, "slide.mp4")
+        subprocess.run([ff, "-y", "-f", "concat", "-safe", "0", "-i", concat,
             "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,fps=30",
-            "-c:v", "libx264", "-preset", "fast", "-crf", "23", "-pix_fmt", "yuv420p",
-            slideshow
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-pix_fmt", "yuv420p", slide
         ], check=True, capture_output=True)
 
-        # 5. Merge audio + video
-        output = os.path.join(job_dir, "final.mp4")
-        subprocess.run([
-            FFMPEG_PATH, "-y", "-i", slideshow, "-i", audio_path,
-            "-c:v", "copy", "-c:a", "aac", "-shortest", "-movflags", "+faststart",
-            output
+        # 6. Merge
+        out = os.path.join(job_dir, "final.mp4")
+        subprocess.run([ff, "-y", "-i", slide, "-i", audio_path,
+            "-c:v", "copy", "-c:a", "aac", "-shortest", "-movflags", "+faststart", out
         ], check=True, capture_output=True)
 
-        # 6. Return as base64
-        with open(output, "rb") as f:
-            video_b64 = base64.b64encode(f.read()).decode()
-
+        video_b64 = base64.b64encode(open(out, "rb").read()).decode()
         shutil.rmtree(job_dir, ignore_errors=True)
-        return jsonify({"status": "success", "job_id": job_id, "video_base64": video_b64, "duration": duration})
+        return {"status": "success", "job_id": job_id, "video_base64": video_b64, "duration": duration}
 
     except subprocess.CalledProcessError as e:
         shutil.rmtree(job_dir, ignore_errors=True)
-        return jsonify({"error": "FFmpeg failed", "details": e.stderr.decode()}), 500
+        return {"error": "FFmpeg failed", "details": e.stderr.decode()}, 500
     except Exception as e:
         shutil.rmtree(job_dir, ignore_errors=True)
-        return jsonify({"error": str(e)}), 500
+        return {"error": str(e)}, 500
 
 @app.route("/tts-only", methods=["POST"])
 def tts_only():
@@ -125,20 +119,18 @@ def tts_only():
     job_dir = os.path.join(WORK_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
     try:
-        data       = request.json
-        text       = data.get("text", "")
-        language   = data.get("language", "english")
-        voice      = VOICES.get(language, VOICES["english"])
-        audio_path = os.path.join(job_dir, "audio.mp3")
-        asyncio.run(generate_tts(text, voice, audio_path))
-        with open(audio_path, "rb") as f:
-            audio_b64 = base64.b64encode(f.read()).decode()
+        data  = request.json
+        text  = data.get("text", "")
+        lang  = data.get("language", "english")
+        voice = VOICES.get(lang, VOICES["english"])
+        path  = os.path.join(job_dir, "audio.mp3")
+        asyncio.run(generate_tts(text, voice, path))
+        b64 = base64.b64encode(open(path, "rb").read()).decode()
         shutil.rmtree(job_dir, ignore_errors=True)
-        return jsonify({"status": "success", "audio_base64": audio_b64, "language": language, "voice": voice})
+        return {"status": "success", "audio_base64": b64, "language": lang, "voice": voice}
     except Exception as e:
         shutil.rmtree(job_dir, ignore_errors=True)
-        return jsonify({"error": str(e)}), 500
+        return {"error": str(e)}, 500
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
