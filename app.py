@@ -1,49 +1,60 @@
 from flask import Flask, request, jsonify
-import subprocess, os, uuid, requests, base64, shutil, json, asyncio
-import edge_tts
+import subprocess, os, uuid, requests, base64, shutil, json
 
 app = Flask(__name__)
 WORK_DIR = "/tmp/videos"
 os.makedirs(WORK_DIR, exist_ok=True)
 
-VOICES = {
-    "english":    "en-US-AriaNeural",
-    "hindi":      "hi-IN-SwaraNeural",
-    "spanish":    "es-ES-ElviraNeural",
-    "arabic":     "ar-EG-SalmaNeural",
-    "french":     "fr-FR-DeniseNeural",
-    "portuguese": "pt-BR-FranciscaNeural"
-}
+def get_ff(name):
+    for p in [f"/usr/bin/{name}", f"/usr/local/bin/{name}"]:
+        if os.path.exists(p): return p
+    return name
 
-async def generate_tts(text, voice, path):
-    await edge_tts.Communicate(text, voice).save(path)
-
-def run_cmd(cmd):
-    r = subprocess.run(cmd, capture_output=True, text=True)
-    if r.returncode != 0:
-        raise Exception(f"Command failed: {r.stderr}")
-    return r.stdout
-
-def get_ffmpeg():
-    for p in ["/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg"]:
-        if os.path.exists(p):
-            return p
-    return "ffmpeg"
-
-def get_ffprobe():
-    for p in ["/usr/bin/ffprobe", "/usr/local/bin/ffprobe"]:
-        if os.path.exists(p):
-            return p
-    return "ffprobe"
+def google_tts(text, path):
+    """Google TTS — free, no API key needed"""
+    # Split text into chunks (Google TTS limit 200 chars)
+    chunks = []
+    words = text.split()
+    chunk = ""
+    for word in words:
+        if len(chunk) + len(word) < 180:
+            chunk += " " + word
+        else:
+            chunks.append(chunk.strip())
+            chunk = word
+    if chunk:
+        chunks.append(chunk.strip())
+    
+    audio_parts = []
+    for i, chunk in enumerate(chunks[:5]):  # max 5 chunks
+        part_path = os.path.join(os.path.dirname(path), f"part_{i}.mp3")
+        url = f"https://translate.google.com/translate_tts?ie=UTF-8&q={requests.utils.quote(chunk)}&tl=en&client=tw-ob"
+        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+        if r.status_code == 200:
+            open(part_path, "wb").write(r.content)
+            audio_parts.append(part_path)
+    
+    if not audio_parts:
+        raise Exception("Google TTS failed — no audio generated")
+    
+    if len(audio_parts) == 1:
+        shutil.copy(audio_parts[0], path)
+    else:
+        # Merge all parts
+        ff = get_ff("ffmpeg")
+        concat = path + "_concat.txt"
+        with open(concat, "w") as f:
+            for p in audio_parts:
+                f.write(f"file '{p}'\n")
+        subprocess.run([ff, "-y", "-f", "concat", "-safe", "0", "-i", concat, "-c", "copy", path], check=True, capture_output=True)
 
 @app.route("/health")
 def health():
-    ff = get_ffmpeg()
     try:
-        v = subprocess.run([ff, "-version"], capture_output=True, text=True).stdout.split('\n')[0]
+        v = subprocess.run([get_ff("ffmpeg"), "-version"], capture_output=True, text=True).stdout.split('\n')[0]
     except:
         v = "not found"
-    return {"status": "ok", "ffmpeg": v, "voices": list(VOICES.keys())}
+    return {"status": "ok", "ffmpeg": v, "tts": "google"}
 
 @app.route("/create-video", methods=["POST"])
 def create_video():
@@ -54,20 +65,22 @@ def create_video():
         data        = request.json
         image_urls  = data.get("image_urls", [])
         script_text = data.get("script_text", "")
-        language    = data.get("language", "english")
+        audio_b64   = data.get("audio_base64", "")
 
         if not image_urls:
             return {"error": "No image_urls"}, 400
-        if not script_text:
-            return {"error": "No script_text"}, 400
+        if not script_text and not audio_b64:
+            return {"error": "Provide script_text or audio_base64"}, 400
 
-        ff = get_ffmpeg()
-        fp = get_ffprobe()
+        ff = get_ff("ffmpeg")
+        fp = get_ff("ffprobe")
 
-        # 1. TTS audio
+        # 1. Audio — Google TTS ya base64
         audio_path = os.path.join(job_dir, "audio.mp3")
-        voice = VOICES.get(language, VOICES["english"])
-        asyncio.run(generate_tts(script_text, voice, audio_path))
+        if audio_b64:
+            open(audio_path, "wb").write(base64.b64decode(audio_b64))
+        else:
+            google_tts(script_text, audio_path)
 
         # 2. Download images
         image_paths = []
@@ -78,10 +91,10 @@ def create_video():
             image_paths.append(p)
 
         # 3. Audio duration
-        probe = subprocess.run([fp, "-v", "quiet", "-print_format", "json", "-show_format", audio_path], capture_output=True, text=True)
+        probe    = subprocess.run([fp, "-v", "quiet", "-print_format", "json", "-show_format", audio_path], capture_output=True, text=True)
         duration = float(json.loads(probe.stdout)["format"]["duration"])
 
-        # 4. Concat file
+        # 4. Concat
         img_dur = duration / len(image_paths)
         concat  = os.path.join(job_dir, "concat.txt")
         with open(concat, "w") as f:
@@ -102,32 +115,13 @@ def create_video():
             "-c:v", "copy", "-c:a", "aac", "-shortest", "-movflags", "+faststart", out
         ], check=True, capture_output=True)
 
-        video_b64 = base64.b64encode(open(out, "rb").read()).decode()
+        video_b64 = base64.b64encode(open(out,"rb").read()).decode()
         shutil.rmtree(job_dir, ignore_errors=True)
         return {"status": "success", "job_id": job_id, "video_base64": video_b64, "duration": duration}
 
     except subprocess.CalledProcessError as e:
         shutil.rmtree(job_dir, ignore_errors=True)
         return {"error": "FFmpeg failed", "details": e.stderr.decode()}, 500
-    except Exception as e:
-        shutil.rmtree(job_dir, ignore_errors=True)
-        return {"error": str(e)}, 500
-
-@app.route("/tts-only", methods=["POST"])
-def tts_only():
-    job_id  = str(uuid.uuid4())[:8]
-    job_dir = os.path.join(WORK_DIR, job_id)
-    os.makedirs(job_dir, exist_ok=True)
-    try:
-        data  = request.json
-        text  = data.get("text", "")
-        lang  = data.get("language", "english")
-        voice = VOICES.get(lang, VOICES["english"])
-        path  = os.path.join(job_dir, "audio.mp3")
-        asyncio.run(generate_tts(text, voice, path))
-        b64 = base64.b64encode(open(path, "rb").read()).decode()
-        shutil.rmtree(job_dir, ignore_errors=True)
-        return {"status": "success", "audio_base64": b64, "language": lang, "voice": voice}
     except Exception as e:
         shutil.rmtree(job_dir, ignore_errors=True)
         return {"error": str(e)}, 500
