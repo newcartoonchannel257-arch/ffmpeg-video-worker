@@ -1,5 +1,5 @@
 from flask import Flask, request, jsonify
-import subprocess, os, uuid, requests, base64, shutil, json
+import subprocess, os, uuid, requests, base64, shutil, json, time
 
 app = Flask(__name__)
 WORK_DIR = "/tmp/videos"
@@ -10,9 +10,22 @@ def get_ff(name):
         if os.path.exists(p): return p
     return name
 
+def download_image(url, path, retries=3):
+    """Download image with retry logic"""
+    for attempt in range(retries):
+        try:
+            r = requests.get(url, timeout=60, headers={"User-Agent": "Mozilla/5.0"})
+            if r.status_code == 200 and len(r.content) > 1000:
+                open(path, "wb").write(r.content)
+                return True
+            time.sleep(3)
+        except Exception as e:
+            print(f"Attempt {attempt+1} failed: {e}")
+            time.sleep(5)
+    return False
+
 def google_tts(text, path):
-    """Google TTS — free, no API key needed"""
-    # Split text into chunks (Google TTS limit 200 chars)
+    """Google TTS — free, no API key"""
     chunks = []
     words = text.split()
     chunk = ""
@@ -24,23 +37,25 @@ def google_tts(text, path):
             chunk = word
     if chunk:
         chunks.append(chunk.strip())
-    
+
     audio_parts = []
-    for i, chunk in enumerate(chunks[:5]):  # max 5 chunks
+    for i, chunk in enumerate(chunks[:5]):
         part_path = os.path.join(os.path.dirname(path), f"part_{i}.mp3")
         url = f"https://translate.google.com/translate_tts?ie=UTF-8&q={requests.utils.quote(chunk)}&tl=en&client=tw-ob"
-        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
-        if r.status_code == 200:
-            open(part_path, "wb").write(r.content)
-            audio_parts.append(part_path)
-    
+        try:
+            r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
+            if r.status_code == 200:
+                open(part_path, "wb").write(r.content)
+                audio_parts.append(part_path)
+        except Exception as e:
+            print(f"TTS chunk {i} failed: {e}")
+
     if not audio_parts:
-        raise Exception("Google TTS failed — no audio generated")
-    
+        raise Exception("Google TTS failed")
+
     if len(audio_parts) == 1:
         shutil.copy(audio_parts[0], path)
     else:
-        # Merge all parts
         ff = get_ff("ffmpeg")
         concat = path + "_concat.txt"
         with open(concat, "w") as f:
@@ -75,19 +90,23 @@ def create_video():
         ff = get_ff("ffmpeg")
         fp = get_ff("ffprobe")
 
-        # 1. Audio — Google TTS ya base64
+        # 1. Audio
         audio_path = os.path.join(job_dir, "audio.mp3")
         if audio_b64:
             open(audio_path, "wb").write(base64.b64decode(audio_b64))
         else:
             google_tts(script_text, audio_path)
 
-        # 2. Download images
+        # 2. Download images with retry
         image_paths = []
+        fallback_colors = ["red", "blue", "green", "orange", "purple"]
         for i, url in enumerate(image_urls[:5]):
             p = os.path.join(job_dir, f"img_{i:02d}.jpg")
-            r = requests.get(url, timeout=30)
-            open(p, "wb").write(r.content)
+            success = download_image(url, p)
+            if not success:
+                # Create solid color fallback image
+                color = fallback_colors[i % len(fallback_colors)]
+                subprocess.run([ff, "-y", "-f", "lavfi", "-i", f"color={color}:size=1080x1920:duration=1", "-frames:v", "1", p], capture_output=True)
             image_paths.append(p)
 
         # 3. Audio duration
